@@ -5,92 +5,179 @@ on:
   workflow_dispatch:
     inputs:
       rebuild:
-        description: Rebuild the current release and warm the build cache
+        description: Rebuild the current release and warm the build caches
         type: boolean
         default: false
 permissions:
-  contents: write
-  packages: write
+  contents: read
 concurrency:
   group: upstream-release
   cancel-in-progress: false
+
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
+      image: ${{ steps.release.outputs.image }}
+      build: ${{ steps.release.outputs.build }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.MIRROR_TOKEN || github.token }}
-      - name: Find latest upstream release
+      - name: Resolve upstream release and check published image
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: echo "tag=$(gh api repos/router-for-me/CLIProxyAPI/releases/latest --jq .tag_name)" >> "$GITHUB_OUTPUT"
-      - name: Mirror upstream tag and source
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          MIRROR_ENABLED: ${{ secrets.MIRROR_TOKEN != '' }}
+          OWNER: ${{ github.repository_owner }}
+          REBUILD: ${{ inputs.rebuild }}
         run: |
-          if [ "$MIRROR_ENABLED" != true ]; then
-            echo '::notice::MIRROR_TOKEN is not configured; existing mirrored tags can still be released.'
-            exit 0
+          tag=$(gh api repos/router-for-me/CLIProxyAPI/releases/latest --jq .tag_name)
+          ref="refs/tags/$tag"
+          refs=$(git ls-remote --exit-code https://github.com/router-for-me/CLIProxyAPI.git "$ref" "$ref^{}")
+          commit=$(awk -v ref="$ref" '$2 == ref { tag=$1 } $2 == ref "^{}" { peeled=$1 } END { print (peeled ? peeled : tag) }' <<< "$refs")
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          image="ghcr.io/${OWNER,,}/cliproxyapi"
+          build=true
+
+          if [[ "$REBUILD" != true ]] &&
+            version=$(docker buildx imagetools inspect "$image:$tag" --format '{{json .Manifest}}') &&
+            latest=$(docker buildx imagetools inspect "$image:latest" --format '{{json .Manifest}}') &&
+            jq -e --argjson latest "$latest" '
+              .digest == $latest.digest and
+              ([.manifests[]? | .platform | "\(.os)/\(.architecture)"] | sort) == ["linux/amd64", "linux/arm64"]
+            ' <<< "$version" >/dev/null; then
+            build=false
           fi
-          git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git
-          git fetch --no-tags upstream "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-          git push origin "+refs/tags/$RELEASE_TAG^{}:refs/heads/upstream-release" "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-      - uses: docker/setup-qemu-action@v3
+          printf 'tag=%s\ncommit=%s\nimage=%s\nbuild=%s\n' "$tag" "$commit" "$image" "$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    name: Build linux/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
         with:
-          platforms: arm64
+          repository: router-for-me/CLIProxyAPI
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Check for existing image
+          password: ${{ github.token }}
+      - name: Build and push by digest
         id: image
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          OWNER: ${{ github.repository_owner }}
-        run: |
-          image="ghcr.io/${OWNER,,}/cliproxyapi"
-          echo "name=$image" >> "$GITHUB_OUTPUT"
-          if docker buildx imagetools inspect "$image:$RELEASE_TAG" >/dev/null 2>&1; then
-            echo 'exists=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'exists=false' >> "$GITHUB_OUTPUT"
-          fi
-      - name: Check out release
-        if: steps.image.outputs.exists != 'true' || inputs.rebuild == true
-        uses: actions/checkout@v4
-        with:
-          repository: router-for-me/CLIProxyAPI
-          ref: ${{ steps.release.outputs.tag }}
-          path: upstream
-          persist-credentials: false
-      - name: Build and publish
-        if: steps.image.outputs.exists != 'true' || inputs.rebuild == true
         uses: docker/build-push-action@v6
         with:
-          context: ./upstream
-          push: true
-          platforms: linux/amd64,linux/arm64
+          context: .
+          platforms: linux/${{ matrix.arch }}
           provenance: false
+          sbom: false
+          outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           cache-from: |
+            type=gha,scope=cliproxyapi-${{ matrix.arch }}
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.arch }}
             type=gha,scope=cliproxyapi
-            type=registry,ref=${{ steps.image.outputs.name }}:buildcache
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache
           cache-to: |
-            type=gha,mode=max,scope=cliproxyapi,ignore-error=true
-            type=registry,ref=${{ steps.image.outputs.name }}:buildcache,mode=max,ignore-error=true
-          tags: |
-            ${{ steps.image.outputs.name }}:${{ steps.release.outputs.tag }}
-            ${{ steps.image.outputs.name }}:latest
+            type=gha,mode=max,scope=cliproxyapi-${{ matrix.arch }},ignore-error=true
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.arch }},mode=max,ignore-error=true
           build-args: |
-            VERSION=${{ steps.release.outputs.tag }}
+            VERSION=${{ needs.prepare.outputs.tag }}
+      - name: Smoke test native image
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}@${{ steps.image.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: timeout 90 docker run --rm --network none --platform "linux/$ARCH" --entrypoint /CLIProxyAPI/CLIProxyAPI "$IMAGE" -h
+      - name: Record image digest
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digest.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest.txt
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  publish:
+    needs: [prepare, build]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      packages: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+      IMAGE: ${{ needs.prepare.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MIRROR_TOKEN || github.token }}
+      - uses: actions/download-artifact@v4
+        if: needs.build.result == 'success'
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+      - uses: docker/login-action@v3
+        if: needs.build.result == 'success'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish the two-platform image
+        if: needs.build.result == 'success'
+        run: |
+          amd64=$(cat "$RUNNER_TEMP/digests/digest-amd64/digest.txt")
+          arm64=$(cat "$RUNNER_TEMP/digests/digest-arm64/digest.txt")
+          sources=("$IMAGE@$amd64" "$IMAGE@$arm64")
+          candidate=$(mktemp)
+          docker buildx imagetools create --dry-run "${sources[@]}" > "$candidate"
+          jq -e --arg amd64 "$amd64" --arg arm64 "$arm64" '
+            (.manifests | length) == 2 and
+            any(.manifests[]; .digest == $amd64 and .platform.os == "linux" and .platform.architecture == "amd64") and
+            any(.manifests[]; .digest == $arm64 and .platform.os == "linux" and .platform.architecture == "arm64")
+          ' "$candidate" >/dev/null
+          docker buildx imagetools create --tag "$IMAGE:$RELEASE_TAG" --tag "$IMAGE:latest" "${sources[@]}"
+
+          version=$(docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{json .Manifest}}')
+          latest=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}')
+          jq -e --argjson latest "$latest" --slurpfile candidate "$candidate" '
+            .digest == $latest.digest and .manifests == $candidate[0].manifests
+          ' <<< "$version" >/dev/null
+      - name: Mirror upstream tag and source
+        env:
+          MIRROR_ENABLED: ${{ secrets.MIRROR_TOKEN != '' }}
+        run: |
+          if [[ "$MIRROR_ENABLED" != true ]]; then
+            echo '::notice::MIRROR_TOKEN is not configured; existing mirrored tags can still be released.'
+            exit 0
+          fi
+          git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git
+          ref="refs/tags/$RELEASE_TAG"
+          git fetch --no-tags upstream "$ref:$ref"
+          [[ "$(git rev-parse "$ref^{}")" == "$RELEASE_COMMIT" ]]
+          git push --atomic origin "+$ref^{}:refs/heads/upstream-release" "$ref:$ref"
       - name: Publish mirrored release notes
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           if ! git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null; then
             echo '::warning::Upstream tag is not mirrored. Set MIRROR_TOKEN to publish this release.'
