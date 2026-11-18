@@ -71,6 +71,7 @@ jobs:
         with:
           context: ./upstream
           push: true
+          provenance: false
           cache-from: type=gha,scope=cliproxyapi
           cache-to: type=gha,mode=max,scope=cliproxyapi
           tags: |
