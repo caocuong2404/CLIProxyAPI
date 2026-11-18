@@ -72,8 +72,12 @@ jobs:
           context: ./upstream
           push: true
           provenance: false
-          cache-from: type=gha,scope=cliproxyapi
-          cache-to: type=gha,mode=max,scope=cliproxyapi
+          cache-from: |
+            type=gha,scope=cliproxyapi
+            type=registry,ref=${{ steps.image.outputs.name }}:buildcache
+          cache-to: |
+            type=gha,mode=max,scope=cliproxyapi,ignore-error=true
+            type=registry,ref=${{ steps.image.outputs.name }}:buildcache,mode=max,ignore-error=true
           tags: |
             ${{ steps.image.outputs.name }}:${{ steps.release.outputs.tag }}
             ${{ steps.image.outputs.name }}:latest
