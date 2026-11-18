@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: '17 */6 * * *'
   workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Rebuild the current release and warm the build cache
+        type: boolean
+        default: false
 permissions:
   contents: write
   packages: write
@@ -53,7 +58,7 @@ jobs:
             echo 'exists=false' >> "$GITHUB_OUTPUT"
           fi
       - name: Check out release
-        if: steps.image.outputs.exists != 'true'
+        if: steps.image.outputs.exists != 'true' || inputs.rebuild == true
         uses: actions/checkout@v4
         with:
           repository: router-for-me/CLIProxyAPI
@@ -61,11 +66,13 @@ jobs:
           path: upstream
           persist-credentials: false
       - name: Build and publish
-        if: steps.image.outputs.exists != 'true'
+        if: steps.image.outputs.exists != 'true' || inputs.rebuild == true
         uses: docker/build-push-action@v6
         with:
           context: ./upstream
           push: true
+          cache-from: type=gha,scope=cliproxyapi
+          cache-to: type=gha,mode=max,scope=cliproxyapi
           tags: |
             ${{ steps.image.outputs.name }}:${{ steps.release.outputs.tag }}
             ${{ steps.image.outputs.name }}:latest
